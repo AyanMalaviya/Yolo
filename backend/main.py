@@ -1,4 +1,8 @@
-import threading, time, cv2, json, logging
+import threading
+import time
+import cv2
+import json
+import logging
 import numpy as np
 import torch
 from fastapi import FastAPI, UploadFile, File
@@ -8,8 +12,10 @@ from pathlib import Path
 from PIL import Image as PILImage
 from datetime import datetime
 from detector import (
-    load_yolo, state, state_lock,
-    WEAPON_CLASSES, ProximityTracker,
+    load_yolo, load_weapon_model, load_vlm,
+    run_vlm, run_weapon_inference, draw_weapon_boxes,
+    state, state_lock,
+    WEAPON_CLASSES, ProximityTracker, PeopleLogger,
     push_alert, pad_crop,
     VLM_COOLDOWN_SEC, RED_HOLD_SEC, RED_CONFIDENCE, LINE_POSITION
 )
@@ -21,16 +27,15 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 # ── Stream settings ───────────────────────────────────────────────────────────
-STREAM_WIDTH        = 640
-STREAM_HEIGHT       = 480
-STREAM_FPS          = 30
-PROCESS_EVERY       = 2      # run YOLO every Nth frame
+STREAM_WIDTH  = 640
+STREAM_HEIGHT = 480
+STREAM_FPS    = 30   # only used as fallback for camera sources
 
 # ── VLM timing ────────────────────────────────────────────────────────────────
-SCENE_INTERVAL          = 8.0    # passive scene every N seconds
-NEW_PERSON_COOLDOWN     = 15.0   # re-describe same person after N seconds
-VLM_COOLDOWN            = 4.0
-COUNT_CHANGE_DELAY      = 2.0    # wait N seconds after count change before VLM
+SCENE_INTERVAL      = 8.0
+NEW_PERSON_COOLDOWN = 15.0
+VLM_COOLDOWN        = 4.0
+COUNT_CHANGE_DELAY  = 2.0
 
 app = FastAPI()
 app.add_middleware(
@@ -44,33 +49,13 @@ app.add_middleware(
 state["scene_description"] = "Waiting for first analysis..."
 state["detection_summary"] = ""
 state["person_log"]        = []
-state["person_count"]      = 0   # live tracked person count
+state["person_count"]      = 0
+state["weapon_detections"] = []
+state["source_fps"]        = 0.0   # actual FPS of current source
 
 # ── Load models ───────────────────────────────────────────────────────────────
-yolo_model    = load_yolo()
-vlm_model     = None
-vlm_processor = None
-
-def load_vlm():
-    global vlm_model, vlm_processor
-    try:
-        from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
-        log.info("Loading SmolVLM2-2.2B (4-bit)...")
-        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-        vlm_processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM2-2.2B-Instruct")
-        vlm_model = AutoModelForImageTextToText.from_pretrained(
-            "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
-            quantization_config=bnb,
-            device_map="cuda",
-            _attn_implementation="eager"
-        )
-        vlm_model.eval()
-        log.info("SmolVLM2-2.2B ready.")
-        return vlm_model, vlm_processor
-    except Exception as e:
-        log.warning(f"VLM load failed: {e}. Running YOLO-only mode.")
-        return None, None
-
+yolo_model   = load_yolo()
+weapon_model = load_weapon_model()
 vlm_model, vlm_processor = load_vlm()
 
 # ── Engine state ──────────────────────────────────────────────────────────────
@@ -99,90 +84,51 @@ Include: how many people are visible, what they are doing, anything notable.
 Example: Three people are now visible, one just entered from the left carrying a bag.
 Reply with ONLY the description sentence — no extra text."""
 
-THREAT_PROMPT = """Look at this image carefully.
-Is there a violent attack, weapon being used aggressively, or forced break-in happening?
-Reply with ONLY this format:
-THREAT: yes or no. One sentence reason.
-Example: THREAT: no. Two people are talking normally.
-Example: THREAT: yes. A person is swinging an axe at another person."""
 
-# ── VLM helpers ───────────────────────────────────────────────────────────────
-def resize_for_vlm(crop_bgr, max_px=512):
-    h, w  = crop_bgr.shape[:2]
-    scale = max_px / max(h, w)
-    if scale < 1.0:
-        return cv2.resize(crop_bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
-    return crop_bgr
-
-def call_vlm_text(crop_bgr, prompt):
+# ── VLM scene/person helpers (SmolVLM2) ──────────────────────────────────────
+def call_vlm_text(crop_bgr: np.ndarray, prompt: str) -> str:
     if vlm_model is None or vlm_processor is None:
         return ""
     try:
-        crop  = resize_for_vlm(crop_bgr)
-        image = PILImage.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        image = PILImage.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
+        h, w  = crop_bgr.shape[:2]
+        scale = 512 / max(h, w)
+        if scale < 1.0:
+            image = image.resize((int(w * scale), int(h * scale)))
 
         messages = [{
             "role": "user",
-            "content": [
-                {"type": "image"},                  # placeholder only
-                {"type": "text", "text": prompt}
-            ]
+            "content": [{"type": "image"}, {"type": "text", "text": prompt}]
         }]
-
-        # Step 1 — build text prompt from template (no tokenize here)
-        text_prompt = vlm_processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True
-        )
-
-        # Step 2 — pass image separately to processor
-        inputs = vlm_processor(
-            text=text_prompt,
-            images=[image],                         # ← image passed here
-            return_tensors="pt"
+        text_prompt = vlm_processor.apply_chat_template(messages, add_generation_prompt=True)
+        inputs      = vlm_processor(
+            text=text_prompt, images=[image], return_tensors="pt"
         ).to(vlm_model.device, dtype=torch.bfloat16)
 
         with torch.no_grad():
-            generated_ids = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=80)
+            out = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=80)
 
-        result = vlm_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-
+        result = vlm_processor.batch_decode(out, skip_special_tokens=True)[0].strip()
         if "Assistant:" in result:
             result = result.split("Assistant:")[-1].strip()
         lines = [l.strip() for l in result.split("\n") if l.strip()]
         return lines[-1] if lines else result
     except Exception as e:
-        log.warning(f"VLM error: {e}")
+        log.warning(f"VLM text error: {e}")
         return ""
     finally:
         torch.cuda.empty_cache()
 
-def call_vlm_threat(crop_bgr):
-    try:
-        raw       = call_vlm_text(crop_bgr, THREAT_PROMPT)
-        is_threat = "threat: yes" in raw.lower()
-        desc      = raw.split(".", 1)[-1].strip() if "." in raw else raw
-        return {
-            "threat":      is_threat,
-            "type":        "assault" if is_threat else "none",
-            "confidence":  "high" if is_threat else "low",
-            "description": desc or raw
-        }
-    except Exception as e:
-        return {"threat": False, "type": "none", "confidence": "low", "description": str(e)}
 
 # ── Detection engine ──────────────────────────────────────────────────────────
 def run_engine(source):
-    prox           = ProximityTracker()
-    vlm_thread     = None
-    last_vlm_time  = 0.0
-    described_ids  = {}
-    frame_count    = 0
-    last_annotated = None
-
-    # Person count tracking
-    prev_person_count  = 0
-    count_changed_at   = None   # timestamp when count last changed
+    prox              = ProximityTracker()
+    people_logger     = PeopleLogger()
+    vlm_thread        = None
+    described_ids     = {}
+    prev_person_count = 0
+    count_changed_at  = None
+    frame_count       = 0
 
     try:
         src = int(source)
@@ -190,23 +136,38 @@ def run_engine(source):
         src = source
 
     cap = cv2.VideoCapture(src)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  STREAM_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS,          STREAM_FPS)
+
+    # Only force resolution/fps for camera — not for video files
+    if isinstance(src, int):
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  STREAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS,          STREAM_FPS)
 
     if not cap.isOpened():
         log.error(f"Cannot open source: {source}")
         engine["running"] = False
         return
 
-    actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # ✅ Read actual FPS from source — used to pace playback correctly
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    log.info(f"Stream opened → {source} | {actual_w}x{actual_h} @ {actual_fps:.1f}fps")
+    if actual_fps <= 0 or actual_fps > 120:
+        actual_fps = 30.0   # sane fallback
+
+    frame_delay = 1.0 / actual_fps   # seconds to wait between frames
+
+    with state_lock:
+        state["source_fps"] = round(actual_fps, 2)
+
+    log.info(
+        f"Stream opened → {source} | "
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ "
+        f"{actual_fps:.1f}fps | frame_delay={frame_delay*1000:.1f}ms"
+    )
 
     # ── VLM thread targets ────────────────────────────────────────────────────
     def threat_vlm(crop, reason_prefix):
-        result     = call_vlm_threat(crop)
+        result     = run_vlm(crop, vlm_model, vlm_processor)
         is_threat  = result.get("threat", False)
         confidence = result.get("confidence", "low")
         if is_threat and confidence in RED_CONFIDENCE:
@@ -237,6 +198,8 @@ def run_engine(source):
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     while engine["running"]:
+        loop_start = time.time()   # ✅ track frame start for FPS pacing
+
         ret, frame = cap.read()
         if not ret:
             if isinstance(src, str):
@@ -247,22 +210,25 @@ def run_engine(source):
         frame_count += 1
         now = time.time()
 
-        # Skip YOLO on non-processed frames
-        if frame_count % PROCESS_EVERY != 0:
-            if last_annotated is not None:
-                _, buf = cv2.imencode(".jpg", last_annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                with engine["frame_lock"]:
-                    engine["frame"] = buf.tobytes()
-            continue
+        # ── YOLO26n tracking (every frame) ────────────────────────────────────
+        track_results = yolo_model.track(
+            frame, persist=True, tracker="bytetrack.yaml",
+            conf=0.4, imgsz=640, verbose=False
+        )
 
-        results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml",
-                                   conf=0.4, imgsz=640, verbose=False)
+        # ── Weapons model (every frame) ───────────────────────────────────────
+        weapon_detections, weapon_trigger, weapon_crop = run_weapon_inference(weapon_model, frame)
+
+        # ✅ Always update weapon detections in state
+        with state_lock:
+            state["weapon_detections"] = weapon_detections
 
         people_boxes = {}
-        yolo_trigger = None
+        yolo_trigger = weapon_trigger   # weapon takes priority over proximity
         class_counts = {}
 
-        for box in results[0].boxes:
+        # ── Process YOLO26n boxes ─────────────────────────────────────────────
+        for box in track_results[0].boxes:
             if box.id is None:
                 continue
             cls_id   = int(box.cls)
@@ -272,10 +238,13 @@ def run_engine(source):
             name     = yolo_model.names[cls_id]
             class_counts[name] = class_counts.get(name, 0) + 1
 
-            if cls_id == 0:
+            if cls_id == 0:   # person
                 people_boxes[track_id] = xyxy
+                cy = (xyxy[1] + xyxy[3]) / 2
+                with state_lock:
+                    alert_now = state["alert"]
+                people_logger.update(track_id, cy, frame.shape[0], conf, alert_now)
 
-                # New person VLM description
                 last_described = described_ids.get(track_id, 0)
                 if (vlm_model is not None and
                         now - last_described > NEW_PERSON_COOLDOWN and
@@ -290,21 +259,17 @@ def run_engine(source):
                         )
                         vlm_thread.start()
 
-            if cls_id in WEAPON_CLASSES and yolo_trigger is None:
-                yolo_trigger = (f"Weapon: {WEAPON_CLASSES[cls_id]}", pad_crop(frame, xyxy))
-
-        # ── Person count change detection ─────────────────────────────────────
+        # ── Person count change ───────────────────────────────────────────────
         current_count = len(people_boxes)
         with state_lock:
             state["person_count"] = current_count
 
         if current_count != prev_person_count:
-            direction = "entered" if current_count > prev_person_count else "left"
-            log.info(f"[COUNT] {prev_person_count} → {current_count} person(s) | someone {direction}")
+            direction        = "entered" if current_count > prev_person_count else "left"
+            log.info(f"[COUNT] {prev_person_count} → {current_count} | someone {direction}")
             count_changed_at  = now
             prev_person_count = current_count
 
-        # Fire VLM 2 seconds after count change stabilizes
         with state_lock:
             last_vlm = state["last_vlm_time"]
 
@@ -315,16 +280,16 @@ def run_engine(source):
                 (vlm_thread is None or not vlm_thread.is_alive())):
             with state_lock:
                 state["last_vlm_time"] = now
-            count_changed_at = None   # reset so it doesn't fire again
+            count_changed_at = None
             vlm_thread = threading.Thread(
                 target=scene_vlm,
                 args=(frame.copy(), COUNT_CHANGE_PROMPT),
                 daemon=True
             )
             vlm_thread.start()
-            log.info(f"[COUNT VLM] Triggered — {current_count} person(s) in frame")
+            log.info(f"[COUNT VLM] triggered — {current_count} person(s)")
 
-        # Proximity check
+        # ── Proximity check ───────────────────────────────────────────────────
         if yolo_trigger is None:
             prox_result = prox.update(people_boxes)
             if prox_result:
@@ -336,7 +301,7 @@ def run_engine(source):
             last_red  = state["last_red_time"]
             last_vlm  = state["last_vlm_time"]
 
-        # Threat VLM dispatch
+        # ── Threat VLM dispatch ───────────────────────────────────────────────
         if yolo_trigger:
             reason, crop = yolo_trigger
             if (vlm_model is not None and
@@ -355,7 +320,7 @@ def run_engine(source):
                     (vlm_thread is None or not vlm_thread.is_alive())):
                 push_alert("CLEAR", "")
 
-        # Passive scene description (fallback if no count change for a while)
+        # ── Passive scene VLM ─────────────────────────────────────────────────
         if (vlm_model is not None and
                 now - last_vlm >= SCENE_INTERVAL and
                 count_changed_at is None and
@@ -367,13 +332,21 @@ def run_engine(source):
                 target=scene_vlm, args=(frame.copy(),), daemon=True)
             vlm_thread.start()
 
-        # Detection summary
-        summary = ", ".join(f"{v}× {k}" for k, v in class_counts.items()) or "Nothing detected"
+        # ── Detection summary ─────────────────────────────────────────────────
+        weapon_names = [d["label"] for d in weapon_detections]
+        person_str   = f"{len(people_boxes)} person(s)" if people_boxes else ""
+        weapon_str   = f"⚠️ {', '.join(weapon_names)}"  if weapon_names else ""
+        other_str    = ", ".join(
+            f"{v}× {k}" for k, v in class_counts.items()
+            if k != "person" and k not in weapon_names
+        )
+        summary = " | ".join(p for p in [person_str, weapon_str, other_str] if p) or "Nothing detected"
         with state_lock:
             state["detection_summary"] = summary
 
         # ── Overlay ───────────────────────────────────────────────────────────
-        annotated = results[0].plot()
+        annotated = track_results[0].plot()
+        annotated = draw_weapon_boxes(annotated, weapon_detections)
         h, w      = annotated.shape[:2]
 
         with state_lock:
@@ -382,29 +355,40 @@ def run_engine(source):
             desc_now   = state["scene_description"]
             count_now  = state["person_count"]
 
-        color = {"CLEAR":(30,160,30), "YELLOW":(0,180,255), "RED":(0,0,210)}.get(alert_now, (60,60,60))
-        cv2.rectangle(annotated, (0,0), (w, 52), color, -1)
+        color = {"CLEAR": (30,160,30), "YELLOW": (0,180,255), "RED": (0,0,210)}.get(alert_now, (60,60,60))
+        cv2.rectangle(annotated, (0, 0), (w, 52), color, -1)
         cv2.putText(annotated, f"[{alert_now}]  {reason_now[:72]}",
-                    (8, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0,0,0), 2)
+                    (8, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 0, 0), 2)
 
-        # Person count badge top-right
-        cv2.rectangle(annotated, (w-160, 0), (w, 52), (30,30,30), -1)
+        cv2.rectangle(annotated, (w-160, 0), (w, 52), (30, 30, 30), -1)
         cv2.putText(annotated, f"People: {count_now}",
-                    (w-150, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255,255,255), 2)
+                    (w-150, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
 
-        # Scene description bottom
+        # FPS indicator (bottom-right)
+        cv2.putText(annotated, f"{actual_fps:.0f}fps",
+                    (w-60, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
+
         if desc_now:
             cv2.putText(annotated, f"Scene: {desc_now[:90]}",
-                        (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200,255,200), 1)
+                        (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 255, 200), 1)
 
-        last_annotated = annotated.copy()
         _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
         with engine["frame_lock"]:
             engine["frame"] = buf.tobytes()
 
+        # ✅ FPS pacing — sleep for remaining time to honour source FPS
+        elapsed    = time.time() - loop_start
+        sleep_time = frame_delay - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
     cap.release()
     engine["running"] = False
+    with state_lock:
+        state["weapon_detections"] = []
+        state["source_fps"]        = 0.0
     push_alert("CLEAR", "")
+
 
 # ── MJPEG stream ──────────────────────────────────────────────────────────────
 def mjpeg_generator():
@@ -415,6 +399,7 @@ def mjpeg_generator():
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
         time.sleep(0.03)
 
+
 # ── Engine helpers ────────────────────────────────────────────────────────────
 def _stop_engine():
     engine["running"] = False
@@ -423,10 +408,12 @@ def _stop_engine():
     with state_lock:
         state["alert"]           = "CLEAR"
         state["reason"]          = ""
-        state["vlm_description"] = ""
         state["person_count"]    = 0
+        state["weapon_detections"] = []
+        state["source_fps"]      = 0.0
     with engine["frame_lock"]:
         engine["frame"] = None
+
 
 def _start_engine(source):
     _stop_engine()
@@ -435,16 +422,19 @@ def _start_engine(source):
     engine["thread"]  = threading.Thread(target=run_engine, args=(source,), daemon=True)
     engine["thread"].start()
 
+
 # ── API Routes ────────────────────────────────────────────────────────────────
 @app.get("/video_feed")
 def video_feed():
     return StreamingResponse(mjpeg_generator(),
                              media_type="multipart/x-mixed-replace; boundary=frame")
 
+
 @app.post("/start/camera")
 def start_camera(index: int = 0):
     _start_engine(index)
     return {"status": "started", "source": f"camera:{index}"}
+
 
 @app.post("/start/video")
 async def start_video(file: UploadFile = File(...)):
@@ -454,15 +444,18 @@ async def start_video(file: UploadFile = File(...)):
     _start_engine(str(save_path))
     return {"status": "started", "source": file.filename}
 
+
 @app.post("/start/path")
 def start_path(path: str):
     _start_engine(path)
     return {"status": "started", "source": path}
 
+
 @app.post("/stop")
 def stop():
     _stop_engine()
     return {"status": "stopped"}
+
 
 @app.get("/status")
 def get_status():
@@ -477,17 +470,22 @@ def get_status():
             "scene_description": state["scene_description"],
             "detection_summary": state["detection_summary"],
             "person_count":      state["person_count"],
+            "weapon_detections": state["weapon_detections"],
+            "source_fps":        state["source_fps"],
         }
+
 
 @app.get("/alerts")
 def get_alerts():
     with state_lock:
         return state["alert_log"]
 
+
 @app.get("/persons")
 def get_persons():
     with state_lock:
         return state["person_log"]
+
 
 @app.get("/logs")
 def get_logs():
@@ -497,12 +495,13 @@ def get_logs():
             return json.load(f)
     return []
 
+
 @app.get("/vram")
 def get_vram():
     try:
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved  = torch.cuda.memory_reserved()  / 1024**3
-        total     = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        allocated = torch.cuda.memory_allocated() / 1024 ** 3
+        reserved  = torch.cuda.memory_reserved()  / 1024 ** 3
+        total     = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
         return {
             "total_gb":     round(total, 2),
             "allocated_gb": round(allocated, 2),
@@ -512,3 +511,8 @@ def get_vram():
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/weapon_classes")
+def get_weapon_classes():
+    return {"classes": list(WEAPON_CLASSES.values())}
