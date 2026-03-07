@@ -29,12 +29,12 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # ── Stream settings ───────────────────────────────────────────────────────────
 STREAM_WIDTH  = 640
 STREAM_HEIGHT = 480
-STREAM_FPS    = 30   # only used as fallback for camera sources
+STREAM_FPS    = 30
 
-# ── VLM timing ────────────────────────────────────────────────────────────────
-SCENE_INTERVAL      = 8.0
-NEW_PERSON_COOLDOWN = 15.0
-VLM_COOLDOWN        = 4.0
+# ── VLM timing (increased for RTX 3060 6GB headroom) ─────────────────────────
+SCENE_INTERVAL      = 15.0   # passive scene every 15s (was 8)
+NEW_PERSON_COOLDOWN = 30.0   # re-describe person after 30s (was 15)
+VLM_COOLDOWN        = 8.0    # min gap between any VLM call (was 4)
 COUNT_CHANGE_DELAY  = 2.0
 
 app = FastAPI()
@@ -51,12 +51,31 @@ state["detection_summary"] = ""
 state["person_log"]        = []
 state["person_count"]      = 0
 state["weapon_detections"] = []
-state["source_fps"]        = 0.0   # actual FPS of current source
+state["source_fps"]        = 0.0
+state["vlm_enabled"]       = True
 
 # ── Load models ───────────────────────────────────────────────────────────────
-yolo_model   = load_yolo()
-weapon_model = load_weapon_model()
+yolo_model            = load_yolo()
+weapon_model          = load_weapon_model()
 vlm_model, vlm_processor = load_vlm()
+
+# ── GPU optimizations for RTX 3060 6GB ───────────────────────────────────────
+if torch.cuda.is_available():
+    # Reserve max 85% of VRAM — prevents OOM crashes (~5.1GB on 6GB card)
+    torch.cuda.set_per_process_memory_fraction(0.85)
+
+    # Pin YOLO models to GPU once — avoids repeated CPU↔GPU transfers
+    yolo_model.to("cuda")
+    weapon_model.to("cuda")
+
+    # FP16 inference — halves YOLO VRAM usage (~0.8GB → ~0.4GB each)
+    yolo_model.model.half()
+    weapon_model.model.half()
+
+    log.info(
+        f"[GPU] {torch.cuda.get_device_name(0)} | "
+        f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB total"
+    )
 
 # ── Engine state ──────────────────────────────────────────────────────────────
 engine = {
@@ -85,7 +104,7 @@ Example: Three people are now visible, one just entered from the left carrying a
 Reply with ONLY the description sentence — no extra text."""
 
 
-# ── VLM scene/person helpers (SmolVLM2) ──────────────────────────────────────
+# ── VLM scene/person helper (SmolVLM2) ───────────────────────────────────────
 def call_vlm_text(crop_bgr: np.ndarray, prompt: str) -> str:
     if vlm_model is None or vlm_processor is None:
         return ""
@@ -106,7 +125,7 @@ def call_vlm_text(crop_bgr: np.ndarray, prompt: str) -> str:
         ).to(vlm_model.device, dtype=torch.bfloat16)
 
         with torch.no_grad():
-            out = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=80)
+            out = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=60)  # 80→60
 
         result = vlm_processor.batch_decode(out, skip_special_tokens=True)[0].strip()
         if "Assistant:" in result:
@@ -137,7 +156,6 @@ def run_engine(source):
 
     cap = cv2.VideoCapture(src)
 
-    # Only force resolution/fps for camera — not for video files
     if isinstance(src, int):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  STREAM_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_HEIGHT)
@@ -148,12 +166,11 @@ def run_engine(source):
         engine["running"] = False
         return
 
-    # ✅ Read actual FPS from source — used to pace playback correctly
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
     if actual_fps <= 0 or actual_fps > 120:
-        actual_fps = 30.0   # sane fallback
+        actual_fps = 30.0
 
-    frame_delay = 1.0 / actual_fps   # seconds to wait between frames
+    frame_delay = 1.0 / actual_fps
 
     with state_lock:
         state["source_fps"] = round(actual_fps, 2)
@@ -198,7 +215,7 @@ def run_engine(source):
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     while engine["running"]:
-        loop_start = time.time()   # ✅ track frame start for FPS pacing
+        loop_start = time.time()
 
         ret, frame = cap.read()
         if not ret:
@@ -210,21 +227,24 @@ def run_engine(source):
         frame_count += 1
         now = time.time()
 
-        # ── YOLO26n tracking (every frame) ────────────────────────────────────
+        # ── Read vlm_enabled once per frame ──────────────────────────────────
+        with state_lock:
+            vlm_on = state["vlm_enabled"]
+
+        # ── YOLO26n tracking ──────────────────────────────────────────────────
         track_results = yolo_model.track(
             frame, persist=True, tracker="bytetrack.yaml",
             conf=0.4, imgsz=640, verbose=False
         )
 
-        # ── Weapons model (every frame) ───────────────────────────────────────
+        # ── Weapons model ─────────────────────────────────────────────────────
         weapon_detections, weapon_trigger, weapon_crop = run_weapon_inference(weapon_model, frame)
 
-        # ✅ Always update weapon detections in state
         with state_lock:
             state["weapon_detections"] = weapon_detections
 
         people_boxes = {}
-        yolo_trigger = weapon_trigger   # weapon takes priority over proximity
+        yolo_trigger = weapon_trigger
         class_counts = {}
 
         # ── Process YOLO26n boxes ─────────────────────────────────────────────
@@ -245,8 +265,10 @@ def run_engine(source):
                     alert_now = state["alert"]
                 people_logger.update(track_id, cy, frame.shape[0], conf, alert_now)
 
+                # ✅ VLM guard — person description
                 last_described = described_ids.get(track_id, 0)
-                if (vlm_model is not None and
+                if (vlm_on and
+                        vlm_model is not None and
                         now - last_described > NEW_PERSON_COOLDOWN and
                         (vlm_thread is None or not vlm_thread.is_alive())):
                     described_ids[track_id] = now
@@ -273,7 +295,9 @@ def run_engine(source):
         with state_lock:
             last_vlm = state["last_vlm_time"]
 
-        if (count_changed_at is not None and
+        # ✅ VLM guard — count change scene description
+        if (vlm_on and
+                count_changed_at is not None and
                 now - count_changed_at >= COUNT_CHANGE_DELAY and
                 now - last_vlm >= VLM_COOLDOWN and
                 vlm_model is not None and
@@ -301,10 +325,11 @@ def run_engine(source):
             last_red  = state["last_red_time"]
             last_vlm  = state["last_vlm_time"]
 
-        # ── Threat VLM dispatch ───────────────────────────────────────────────
+        # ✅ VLM guard — threat dispatch
         if yolo_trigger:
             reason, crop = yolo_trigger
-            if (vlm_model is not None and
+            if (vlm_on and
+                    vlm_model is not None and
                     now - last_vlm >= VLM_COOLDOWN and
                     (vlm_thread is None or not vlm_thread.is_alive())):
                 with state_lock:
@@ -320,8 +345,9 @@ def run_engine(source):
                     (vlm_thread is None or not vlm_thread.is_alive())):
                 push_alert("CLEAR", "")
 
-        # ── Passive scene VLM ─────────────────────────────────────────────────
-        if (vlm_model is not None and
+        # ✅ VLM guard — passive scene description
+        if (vlm_on and
+                vlm_model is not None and
                 now - last_vlm >= SCENE_INTERVAL and
                 count_changed_at is None and
                 not yolo_trigger and
@@ -350,33 +376,46 @@ def run_engine(source):
         h, w      = annotated.shape[:2]
 
         with state_lock:
-            alert_now  = state["alert"]
-            reason_now = state["reason"]
-            desc_now   = state["scene_description"]
-            count_now  = state["person_count"]
+            alert_now   = state["alert"]
+            reason_now  = state["reason"]
+            desc_now    = state["scene_description"]
+            count_now   = state["person_count"]
+            vlm_on_now  = state["vlm_enabled"]
 
+        # Alert banner
         color = {"CLEAR": (30,160,30), "YELLOW": (0,180,255), "RED": (0,0,210)}.get(alert_now, (60,60,60))
         cv2.rectangle(annotated, (0, 0), (w, 52), color, -1)
         cv2.putText(annotated, f"[{alert_now}]  {reason_now[:72]}",
                     (8, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 0, 0), 2)
 
+        # Person count badge (top-right)
         cv2.rectangle(annotated, (w-160, 0), (w, 52), (30, 30, 30), -1)
         cv2.putText(annotated, f"People: {count_now}",
                     (w-150, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
 
         # FPS indicator (bottom-right)
         cv2.putText(annotated, f"{actual_fps:.0f}fps",
-                    (w-60, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
+                    (w-55, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
 
-        if desc_now:
+        # VLM status indicator (bottom-right, above fps)
+        vlm_label = "VLM:ON" if vlm_on_now else "VLM:OFF"
+        vlm_color = (160, 100, 255) if vlm_on_now else (80, 80, 80)
+        cv2.putText(annotated, vlm_label,
+                    (w-75, h-28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, vlm_color, 1)
+
+        # Scene description (bottom-left)
+        if desc_now and vlm_on_now:
             cv2.putText(annotated, f"Scene: {desc_now[:90]}",
                         (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 255, 200), 1)
+        elif not vlm_on_now:
+            cv2.putText(annotated, "VLM disabled — YOLO detection only",
+                        (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (80, 80, 80), 1)
 
         _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
         with engine["frame_lock"]:
             engine["frame"] = buf.tobytes()
 
-        # ✅ FPS pacing — sleep for remaining time to honour source FPS
+        # FPS pacing
         elapsed    = time.time() - loop_start
         sleep_time = frame_delay - elapsed
         if sleep_time > 0:
@@ -406,11 +445,11 @@ def _stop_engine():
     if engine["thread"] and engine["thread"].is_alive():
         engine["thread"].join(timeout=3)
     with state_lock:
-        state["alert"]           = "CLEAR"
-        state["reason"]          = ""
-        state["person_count"]    = 0
+        state["alert"]             = "CLEAR"
+        state["reason"]            = ""
+        state["person_count"]      = 0
         state["weapon_detections"] = []
-        state["source_fps"]      = 0.0
+        state["source_fps"]        = 0.0
     with engine["frame_lock"]:
         engine["frame"] = None
 
@@ -472,6 +511,7 @@ def get_status():
             "person_count":      state["person_count"],
             "weapon_detections": state["weapon_detections"],
             "source_fps":        state["source_fps"],
+            "vlm_enabled":       state["vlm_enabled"],
         }
 
 
@@ -516,3 +556,19 @@ def get_vram():
 @app.get("/weapon_classes")
 def get_weapon_classes():
     return {"classes": list(WEAPON_CLASSES.values())}
+
+
+@app.post("/vlm/enable")
+def vlm_enable():
+    with state_lock:
+        state["vlm_enabled"] = True
+    log.info("[VLM] Enabled by user")
+    return {"vlm_enabled": True}
+
+
+@app.post("/vlm/disable")
+def vlm_disable():
+    with state_lock:
+        state["vlm_enabled"] = False
+    log.info("[VLM] Disabled by user")
+    return {"vlm_enabled": False}

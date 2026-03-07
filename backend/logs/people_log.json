@@ -47,5 +47,26 @@
     "event": "EXIT",
     "confidence": 0.95,
     "alert_state": "CLEAR"
+  },
+  {
+    "timestamp": "2026-03-07 03:54:08",
+    "track_id": 11,
+    "event": "EXIT",
+    "confidence": 0.85,
+    "alert_state": "CLEAR"
+  },
+  {
+    "timestamp": "2026-03-07 03:54:09",
+    "track_id": 17,
+    "event": "ENTER",
+    "confidence": 0.41,
+    "alert_state": "CLEAR"
+  },
+  {
+    "timestamp": "2026-03-07 14:24:29",
+    "track_id": 2,
+    "event": "EXIT",
+    "confidence": 0.81,
+    "alert_state": "CLEAR"
   }
 ]
