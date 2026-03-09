@@ -13,12 +13,15 @@ from PIL import Image as PILImage
 from datetime import datetime
 from detector import (
     load_yolo, load_weapon_model, load_vlm,
-    run_vlm, run_weapon_inference, draw_weapon_boxes,
+    run_vlm, vlm_infer, run_weapon_inference, draw_weapon_boxes,
     state, state_lock,
     WEAPON_CLASSES, ProximityTracker,
-    push_alert, pad_crop,
-    VLM_COOLDOWN_SEC, RED_HOLD_SEC, RED_CONFIDENCE
+    push_alert, pad_crop, get_vram_usage_pct,
+    VLM_COOLDOWN_SEC, RED_HOLD_SEC, RED_CONFIDENCE,
+    GPU_YOLO, GPU_VLM,
+    _vlm_is_qwen,
 )
+import detector
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -26,15 +29,15 @@ log = logging.getLogger(__name__)
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# ── Stream / timing constants ─────────────────────────────────────────────────
-STREAM_WIDTH        = 640
-STREAM_HEIGHT       = 480
+# ── Constants ─────────────────────────────────────────────────────────────────
+STREAM_WIDTH        = 1280     # upgraded from 640 — A4000 handles 1080p easily
+STREAM_HEIGHT       = 720
 STREAM_FPS          = 30
 NEW_PERSON_COOLDOWN = 30.0
 VLM_COOLDOWN        = 8.0
 COUNT_CHANGE_DELAY  = 2.0
 VLM_THREAD_TIMEOUT  = 20.0
-WEAPON_MIN_FRAMES   = 3      # consecutive frames weapon must appear before alert
+WEAPON_MIN_FRAMES   = 3
 
 VALID_MODES = {"both", "yolo_only", "vlm_only"}
 
@@ -63,17 +66,26 @@ yolo_model               = load_yolo()
 weapon_model             = load_weapon_model()
 vlm_model, vlm_processor = load_vlm()
 
-# ── GPU optimizations ─────────────────────────────────────────────────────────
-if torch.cuda.is_available():
-    torch.cuda.set_per_process_memory_fraction(0.85)
-    yolo_model.to("cuda")
-    weapon_model.to("cuda")
-    yolo_model.model.half()
-    weapon_model.model.half()
-    log.info(
-        f"[GPU] {torch.cuda.get_device_name(0)} | "
-        f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB total"
-    )
+# ── After load_vlm() call ─────────────────────────────────────────────────────
+if vlm_model is not None:
+    try:
+        model_type = getattr(vlm_model.config, "model_type", "")
+        if "qwen3_vl" in model_type or "qwen2_5_vl" in model_type or "qwen2_vl" in model_type:
+            detector._vlm_is_qwen = True
+            log.info(f"[VLM] Qwen inference path active — model_type: {model_type}")
+    except Exception:
+        pass
+
+
+
+# ── Log GPU layout ────────────────────────────────────────────────────────────
+if torch.cuda.device_count() >= 2:
+    for i in range(2):
+        props = torch.cuda.get_device_properties(i)
+        log.info(f"[GPU {i}] {props.name} | {props.total_memory/1024**3:.1f}GB")
+    log.info(f"[GPU] YOLO+Weapon → {GPU_YOLO} | VLM → {GPU_VLM}")
+else:
+    log.warning("[GPU] Only 1 GPU found — running single-GPU mode")
 
 # ── Engine state ──────────────────────────────────────────────────────────────
 engine = {
@@ -85,7 +97,7 @@ engine = {
 }
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
-PERSON_PROMPT = """Look at this person in the surveillance image.
+PERSON_PROMPT = """Look at this person in the surveillance image. If they are near door, Start with entered or exit depending on which side facing.
 
 Write 2 short sentences:
 1. What are they doing right now?
@@ -101,59 +113,20 @@ COUNT_CHANGE_PROMPT = """The number of people in this surveillance area just cha
 Describe the current scene in one sentence. Incase of any lethal object in hand, start with alert."""
 
 
-# ── VRAM helpers ──────────────────────────────────────────────────────────────
-def get_vram_usage_pct() -> float:
-    try:
-        reserved = torch.cuda.memory_reserved()
-        total    = torch.cuda.get_device_properties(0).total_memory
-        return (reserved / total) * 100
-    except Exception:
-        return 0.0
 
-
-def offload_vlm_to_cpu():
-    global vlm_model
-    if vlm_model is None:
-        return
-    try:
-        log.info("[MODE] Offloading VLM to CPU...")
-        vlm_model = vlm_model.to("cpu")
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        log.info(f"[MODE] VLM offloaded. VRAM: {torch.cuda.memory_reserved()/1024**3:.2f}GB")
-    except Exception as e:
-        log.warning(f"[MODE] VLM offload failed: {e}")
-
-
-def reload_vlm_to_gpu():
-    global vlm_model
-    if vlm_model is None:
-        return
-    try:
-        log.info("[MODE] Reloading VLM to GPU...")
-        vlm_model = vlm_model.to("cuda")
-        torch.cuda.synchronize()
-        log.info(f"[MODE] VLM on GPU. VRAM: {torch.cuda.memory_reserved()/1024**3:.2f}GB")
-    except torch.cuda.OutOfMemoryError:
-        log.error("[MODE] OOM reloading VLM — staying on CPU")
-        torch.cuda.empty_cache()
-    except Exception as e:
-        log.warning(f"[MODE] VLM reload failed: {e}")
-
-
-# ── Safe VLM call — VRAM gated + OOM protected ────────────────────────────────
+# ── VLM thread safety ─────────────────────────────────────────────────────────
 def safe_vlm_call(target_fn, args: tuple):
-    usage = get_vram_usage_pct()
-    if usage > 80.0:
-        log.warning(f"[VLM] VRAM at {usage:.1f}% — skipping to prevent OOM")
-        return
+    """
+    No longer needs VRAM gating — VLM is on its own dedicated GPU 1.
+    Still wraps for OOM safety just in case.
+    """
     try:
         torch.cuda.empty_cache()
         target_fn(*args)
     except torch.cuda.OutOfMemoryError:
-        log.error("[VLM] OOM during inference — clearing VRAM")
+        log.error(f"[VLM] OOM on {GPU_VLM} — clearing cache")
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(GPU_VLM)
     except Exception as e:
         log.warning(f"[VLM] safe_vlm_call error: {e}")
 
@@ -170,54 +143,51 @@ def _start_vlm_thread(target, args):
 
 # ── VLM text helper ───────────────────────────────────────────────────────────
 def call_vlm_text(crop_bgr: np.ndarray, prompt: str) -> str:
-    if vlm_model is None or vlm_processor is None:
-        return ""
+    return vlm_infer(crop_bgr, prompt, vlm_model, vlm_processor, max_tokens=80)
+
+
+# ── VLM offload/reload (mode switching) ──────────────────────────────────────
+def offload_vlm_to_cpu():
+    global vlm_model
+    if vlm_model is None:
+        return
     try:
-        image = PILImage.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
-        h, w  = crop_bgr.shape[:2]
-        scale = 512 / max(h, w)
-        if scale < 1.0:
-            image = image.resize((int(w * scale), int(h * scale)))
-
-        messages = [{
-            "role": "user",
-            "content": [{"type": "image"}, {"type": "text", "text": prompt}]
-        }]
-        text_prompt = vlm_processor.apply_chat_template(messages, add_generation_prompt=True)
-        inputs      = vlm_processor(
-            text=text_prompt, images=[image], return_tensors="pt"
-        ).to(vlm_model.device, dtype=torch.bfloat16)
-
-        with torch.no_grad():
-            out = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=60)
-
-        result = vlm_processor.batch_decode(out, skip_special_tokens=True)[0].strip()
-        if "Assistant:" in result:
-            result = result.split("Assistant:")[-1].strip()
-        lines = [l.strip() for l in result.split("\n") if l.strip()]
-        return lines[-1] if lines else result
-
-    except torch.cuda.OutOfMemoryError:
-        log.error("[VLM] OOM in call_vlm_text")
+        log.info("[MODE] Offloading VLM to CPU...")
+        vlm_model = vlm_model.to("cpu")
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        return ""
+        torch.cuda.synchronize(GPU_VLM)
+        log.info(f"[MODE] VLM offloaded. {GPU_VLM} free: "
+                 f"{torch.cuda.memory_reserved(1)/1024**3:.1f}GB")
     except Exception as e:
-        log.warning(f"VLM text error: {e}")
-        return ""
-    finally:
+        log.warning(f"[MODE] VLM offload failed: {e}")
+
+
+def reload_vlm_to_gpu():
+    global vlm_model
+    if vlm_model is None:
+        return
+    try:
+        log.info(f"[MODE] Reloading VLM to {GPU_VLM}...")
+        vlm_model = vlm_model.to(GPU_VLM)
+        torch.cuda.synchronize(GPU_VLM)
+        log.info(f"[MODE] VLM reloaded. {GPU_VLM} used: "
+                 f"{torch.cuda.memory_reserved(1)/1024**3:.1f}GB")
+    except torch.cuda.OutOfMemoryError:
+        log.error(f"[MODE] OOM reloading VLM to {GPU_VLM}")
         torch.cuda.empty_cache()
+    except Exception as e:
+        log.warning(f"[MODE] VLM reload failed: {e}")
 
 
 # ── Detection engine ──────────────────────────────────────────────────────────
 def run_engine(source):
     prox               = ProximityTracker()
     vlm_thread         = None
-    described_ids      = {}   # track_id → {"time": float, "pos_hash": int}
+    described_ids      = {}
     prev_person_count  = 0
     count_changed_at   = None
     frame_count        = 0
-    weapon_consecutive = 0    # consecutive frames weapon detected
+    weapon_consecutive = 0
 
     try:
         src = int(source)
@@ -246,8 +216,7 @@ def run_engine(source):
     log.info(
         f"Stream opened → {source} | "
         f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-        f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ "
-        f"{actual_fps:.1f}fps"
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {actual_fps:.1f}fps"
     )
 
     # ── VLM thread targets ────────────────────────────────────────────────────
@@ -292,12 +261,10 @@ def run_engine(source):
                 continue
             break
 
-        # ✅ Entire frame body protected — one bad frame never kills the engine
         try:
             frame_count += 1
             now = time.time()
 
-            # ── Read config flags once per frame ──────────────────────────────
             with state_lock:
                 vlm_on       = state["vlm_enabled"]
                 mode         = state["detection_mode"]
@@ -305,7 +272,6 @@ def run_engine(source):
                 last_vlm     = state["last_vlm_time"]
                 is_switching = state["mode_switching"]
 
-            # Skip inference during mode switch — just stream last frame
             if is_switching:
                 elapsed = time.time() - loop_start
                 if frame_delay - elapsed > 0:
@@ -315,7 +281,7 @@ def run_engine(source):
             use_vlm    = vlm_on and mode in ("both", "vlm_only")
             use_weapon = mode in ("both", "yolo_only")
 
-            # ── VLM thread watchdog ────────────────────────────────────────────
+            # ── Watchdog ───────────────────────────────────────────────────────
             if (vlm_thread is not None and
                     vlm_thread.is_alive() and
                     hasattr(vlm_thread, "_start_time") and
@@ -324,69 +290,64 @@ def run_engine(source):
                 vlm_thread = None
                 torch.cuda.empty_cache()
 
-            # Abandon stale VLM thread if switched to yolo_only
             if not use_vlm and vlm_thread is not None and vlm_thread.is_alive():
                 vlm_thread.join(timeout=0.05)
                 if not vlm_thread.is_alive():
                     vlm_thread = None
 
-            # ── YOLO26n tracking ───────────────────────────────────────────────
+            # ── YOLO11l tracking on GPU 0 ──────────────────────────────────────
             track_results = yolo_model.track(
                 frame, persist=True, tracker="bytetrack.yaml",
-                conf=0.4, imgsz=640, verbose=False
+                conf=0.4, imgsz=1280,   # upgraded to 1280 — A4000 handles it
+                verbose=False
             )
 
-            # ── Weapons model ──────────────────────────────────────────────────
+            # ── Weapons model on GPU 0 ─────────────────────────────────────────
             weapon_detections = []
             weapon_trigger    = None
 
             if use_weapon:
                 weapon_detections, weapon_trigger, _ = run_weapon_inference(weapon_model, frame)
 
-            # Consecutive frame counter — resets immediately if no weapon
             if weapon_detections:
                 weapon_consecutive += 1
             else:
                 weapon_consecutive = 0
 
-            # Only trigger after WEAPON_MIN_FRAMES consecutive detections
             confirmed_weapon = weapon_consecutive >= WEAPON_MIN_FRAMES
 
             with state_lock:
                 state["weapon_detections"] = weapon_detections
 
-            people_boxes = {}
-            yolo_trigger = (weapon_trigger if (mode == "both" and confirmed_weapon) else None)
+            people_boxes      = {}
+            yolo_trigger      = (weapon_trigger if (mode == "both"      and confirmed_weapon) else None)
             yolo_only_trigger = (weapon_trigger if (mode == "yolo_only" and confirmed_weapon) else None)
-            class_counts = {}
+            class_counts      = {}
 
-            # ── Process YOLO26n boxes ──────────────────────────────────────────
+            # ── Process YOLO boxes ─────────────────────────────────────────────
             for box in track_results[0].boxes:
                 if box.id is None:
                     continue
                 cls_id   = int(box.cls)
                 track_id = int(box.id)
                 xyxy     = box.xyxy[0].cpu().numpy()
-                conf     = float(box.conf)
                 name     = yolo_model.names[cls_id]
                 class_counts[name] = class_counts.get(name, 0) + 1
 
-                if cls_id == 0:   # person
+                if cls_id == 0:
                     people_boxes[track_id] = xyxy
 
-                    # Position hash — coarse 80px grid
                     cx       = int((xyxy[0] + xyxy[2]) / 2 / 80)
                     cy_grid  = int((xyxy[1] + xyxy[3]) / 2 / 80)
                     pos_hash = cx * 1000 + cy_grid
 
-                    last_entry     = described_ids.get(track_id, {"time": 0, "pos_hash": -1})
-                    first_time     = last_entry["time"] == 0
-                    time_ok        = now - last_entry["time"] > NEW_PERSON_COOLDOWN
-                    moved_far      = last_entry["pos_hash"] != pos_hash
+                    last_entry      = described_ids.get(track_id, {"time": 0, "pos_hash": -1})
+                    first_time      = last_entry["time"] == 0
+                    time_ok         = now - last_entry["time"] > NEW_PERSON_COOLDOWN
+                    moved_far       = last_entry["pos_hash"] != pos_hash
                     should_describe = first_time or (time_ok and moved_far)
 
-                    if (use_vlm and
-                            vlm_model is not None and
+                    if (use_vlm and vlm_model is not None and
                             should_describe and
                             (vlm_thread is None or not vlm_thread.is_alive())):
                         described_ids[track_id] = {"time": now, "pos_hash": pos_hash}
@@ -405,20 +366,17 @@ def run_engine(source):
                 count_changed_at  = now
                 prev_person_count = current_count
 
-            if (use_vlm and
-                    count_changed_at is not None and
+            if (use_vlm and count_changed_at is not None and
                     now - count_changed_at >= COUNT_CHANGE_DELAY and
-                    now - last_vlm >= VLM_COOLDOWN and
-                    vlm_model is not None and
+                    now - last_vlm >= VLM_COOLDOWN and vlm_model is not None and
                     (vlm_thread is None or not vlm_thread.is_alive())):
                 with state_lock:
                     state["last_vlm_time"] = now
                 count_changed_at = None
                 vlm_thread = _start_vlm_thread(
                     scene_vlm, (frame.copy(), COUNT_CHANGE_PROMPT))
-                log.info(f"[COUNT VLM] triggered — {current_count} person(s)")
 
-            # ── Proximity check (both mode only) ───────────────────────────────
+            # ── Proximity check ────────────────────────────────────────────────
             if mode == "both" and yolo_trigger is None:
                 prox_result = prox.update(people_boxes)
                 if prox_result:
@@ -433,17 +391,13 @@ def run_engine(source):
             # ── Alert logic ────────────────────────────────────────────────────
             if mode == "both" and yolo_trigger:
                 reason, crop = yolo_trigger
-                vram_now = get_vram_usage_pct()
-                if (use_vlm and
-                        vlm_model is not None and
-                        vram_now < 75.0 and          # stricter VRAM gate
+                # No VRAM gate needed — VLM is on a dedicated GPU
+                if (use_vlm and vlm_model is not None and
                         now - last_vlm >= VLM_COOLDOWN and
                         (vlm_thread is None or not vlm_thread.is_alive())):
                     with state_lock:
                         state["last_vlm_time"] = now
                     vlm_thread = _start_vlm_thread(threat_vlm, (crop.copy(), reason))
-                elif vram_now >= 75.0:
-                    log.warning(f"[VLM] Skipping threat VLM — VRAM at {vram_now:.1f}%")
                 if cur_alert == "CLEAR":
                     push_alert("YELLOW", reason)
 
@@ -453,18 +407,15 @@ def run_engine(source):
                     push_alert("YELLOW", reason)
 
             else:
-                # No trigger — clear after hold time
                 if (cur_alert != "CLEAR" and
                         now - last_red >= RED_HOLD_SEC and
                         (vlm_thread is None or not vlm_thread.is_alive())):
                     push_alert("CLEAR", "")
 
             # ── Passive scene VLM ──────────────────────────────────────────────
-            if (use_vlm and
-                    vlm_model is not None and
+            if (use_vlm and vlm_model is not None and
                     now - last_vlm >= vlm_ivl and
-                    count_changed_at is None and
-                    not yolo_trigger and
+                    count_changed_at is None and not yolo_trigger and
                     (vlm_thread is None or not vlm_thread.is_alive())):
                 with state_lock:
                     state["last_vlm_time"] = now
@@ -498,29 +449,29 @@ def run_engine(source):
 
             color = {"CLEAR": (30,160,30), "YELLOW": (0,180,255), "RED": (0,0,210)}.get(alert_now, (60,60,60))
             cv2.rectangle(annotated, (0, 0), (w_f, 52), color, -1)
-            cv2.putText(annotated, f"[{alert_now}]  {reason_now[:72]}",
+            cv2.putText(annotated, f"[{alert_now}]  {reason_now[:80]}",
                         (8, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 0, 0), 2)
 
             badge = f"People:{count_now}  [{mode_now.upper()}]"
-            cv2.rectangle(annotated, (w_f-260, 0), (w_f, 52), (30, 30, 30), -1)
+            cv2.rectangle(annotated, (w_f-280, 0), (w_f, 52), (30, 30, 30), -1)
             cv2.putText(annotated, badge,
-                        (w_f-250, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+                        (w_f-270, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
 
             cv2.putText(annotated, f"{actual_fps:.0f}fps",
                         (w_f-55, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
             vlm_active = vlm_on_now and mode_now != "yolo_only"
             vlm_color  = (160, 100, 255) if vlm_active else (80, 80, 80)
             cv2.putText(annotated, "VLM:ON" if vlm_active else "VLM:OFF",
-                        (w_f-75, h_f-28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, vlm_color, 1)
+                        (w_f-80, h_f-28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, vlm_color, 1)
 
             if desc_now and use_vlm:
-                cv2.putText(annotated, f"Scene: {desc_now[:90]}",
+                cv2.putText(annotated, f"Scene: {desc_now[:100]}",
                             (8, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 255, 200), 1)
             elif not use_vlm:
                 cv2.putText(annotated, f"Mode: {mode_now} — VLM inactive",
                             (8, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (80, 80, 80), 1)
 
-            _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
             with engine["frame_lock"]:
                 engine["frame"] = buf.tobytes()
 
@@ -529,11 +480,9 @@ def run_engine(source):
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
             time.sleep(0.5)
-
         except Exception as e:
-            log.error(f"[ENGINE] Frame #{frame_count} error: {e} — skipping frame")
+            log.error(f"[ENGINE] Frame #{frame_count} error: {e} — skipping")
 
-        # FPS pacing — always runs regardless of try/except outcome
         elapsed = time.time() - loop_start
         if frame_delay - elapsed > 0:
             time.sleep(frame_delay - elapsed)
@@ -632,7 +581,8 @@ def get_status():
             "detection_mode":    state["detection_mode"],
             "vlm_interval":      state["vlm_interval"],
             "mode_switching":    state["mode_switching"],
-            "vram_pct":          round(get_vram_usage_pct(), 1),
+            "vram_gpu0_pct":     round(get_vram_usage_pct(0), 1),
+            "vram_gpu1_pct":     round(get_vram_usage_pct(1), 1),
         }
 
 
@@ -650,19 +600,21 @@ def get_persons():
 
 @app.get("/vram")
 def get_vram():
-    try:
-        allocated = torch.cuda.memory_allocated() / 1024 ** 3
-        reserved  = torch.cuda.memory_reserved()  / 1024 ** 3
-        total     = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-        return {
-            "total_gb":     round(total, 2),
-            "allocated_gb": round(allocated, 2),
-            "reserved_gb":  round(reserved, 2),
-            "free_gb":      round(total - reserved, 2),
-            "usage_pct":    round((reserved / total) * 100, 1),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    result = {}
+    for i in range(torch.cuda.device_count()):
+        try:
+            props = torch.cuda.get_device_properties(i)
+            result[f"gpu{i}"] = {
+                "name":         props.name,
+                "total_gb":     round(props.total_memory / 1024**3, 2),
+                "allocated_gb": round(torch.cuda.memory_allocated(i) / 1024**3, 2),
+                "reserved_gb":  round(torch.cuda.memory_reserved(i) / 1024**3, 2),
+                "free_gb":      round((props.total_memory - torch.cuda.memory_reserved(i)) / 1024**3, 2),
+                "usage_pct":    round(get_vram_usage_pct(i), 1),
+            }
+        except Exception as e:
+            result[f"gpu{i}"] = {"error": str(e)}
+    return result
 
 
 @app.get("/weapon_classes")
@@ -674,7 +626,6 @@ def get_weapon_classes():
 def vlm_enable():
     with state_lock:
         state["vlm_enabled"] = True
-    log.info("[VLM] Enabled")
     return {"vlm_enabled": True}
 
 
@@ -682,7 +633,6 @@ def vlm_enable():
 def vlm_disable():
     with state_lock:
         state["vlm_enabled"] = False
-    log.info("[VLM] Disabled")
     return {"vlm_enabled": False}
 
 
@@ -697,13 +647,10 @@ def set_mode(mode: str):
             return {"detection_mode": mode, "mode_switching": False}
         state["mode_switching"] = True
 
-    log.info(f"[MODE] Switching {current_mode} → {mode}")
-
     def do_switch():
         try:
             was_vlm  = current_mode in ("both", "vlm_only")
             will_vlm = mode in ("both", "vlm_only")
-
             if was_vlm and not will_vlm:
                 offload_vlm_to_cpu()
             elif not was_vlm and will_vlm:
@@ -711,7 +658,6 @@ def set_mode(mode: str):
             else:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-
             with state_lock:
                 state["detection_mode"]    = mode
                 state["alert"]             = "CLEAR"
@@ -733,5 +679,4 @@ def set_vlm_interval(seconds: float):
     seconds = max(5.0, min(seconds, 120.0))
     with state_lock:
         state["vlm_interval"] = seconds
-    log.info(f"[VLM] Interval → {seconds}s")
     return {"vlm_interval": seconds}
