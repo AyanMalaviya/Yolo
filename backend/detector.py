@@ -10,23 +10,18 @@ from huggingface_hub import hf_hub_download, list_repo_files
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-
 # ── Config ────────────────────────────────────────────────────────────────────
-YOLO_MODEL_PATH    = "yolo26n.pt"
-WEAPON_MODEL_REPO  = "Subh775/Threat-Detection-YOLOv8n"
-VLM_MODEL_ID       = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
-WEAPON_CLASSES     = {}   # populated by load_weapon_model()
+YOLO_MODEL_PATH   = "yolo26n.pt"
+VLM_MODEL_ID      = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+WEAPON_CLASSES    = {}
 PROXIMITY_DURATION = 2.5
-VLM_COOLDOWN_SEC   = 3.0
-RED_HOLD_SEC       = 6.0
-RED_CONFIDENCE     = {"medium", "high"}
-LINE_POSITION      = 0.5
+VLM_COOLDOWN_SEC  = 3.0
+RED_HOLD_SEC      = 6.0
+RED_CONFIDENCE    = {"medium", "high"}
+LINE_POSITION     = 0.5
 
-LOG_DIR       = Path("logs")
+LOG_DIR      = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-CSV_LOG_PATH  = LOG_DIR / "people_log.csv"
-JSON_LOG_PATH = LOG_DIR / "people_log.json"
-
 
 # ── Shared State ──────────────────────────────────────────────────────────────
 state = {
@@ -41,6 +36,11 @@ state = {
     "detection_summary": "",
     "weapon_detections": [],
     "source_fps":        0.0,
+    "person_log":        [],
+    "person_count":      0,
+    "vlm_enabled":       True,
+    "detection_mode":    "both",
+    "vlm_interval":      15.0,
 }
 
 state_lock = threading.Lock()
@@ -48,21 +48,19 @@ state_lock = threading.Lock()
 
 # ── Model Loaders ─────────────────────────────────────────────────────────────
 def load_yolo():
-    log.info("Loading YOLO26n for tracking...")
+    log.info("Loading YOLO26n...")
     model = YOLO(YOLO_MODEL_PATH)
-    log.info(f"YOLO26n ready. {len(model.names)} classes.")
+    log.info(f"YOLO26n ready — {len(model.names)} classes.")
     return model
 
 
 def load_weapon_model():
     global WEAPON_CLASSES
-
     candidates = [
         "Subh775/Threat-Detection-YOLOv8n",
         "Subh775/Firearm_Detection_Yolov8n",
         "Hadi959/weapon-detection-yolov8",
     ]
-
     for repo_id in candidates:
         try:
             files    = list(list_repo_files(repo_id))
@@ -80,7 +78,6 @@ def load_weapon_model():
         except Exception as e:
             log.warning(f"[WEAPON] {repo_id} failed: {e}. Trying next...")
 
-    # COCO fallback — knife and scissors only
     log.warning("[WEAPON] All HF models failed. Falling back to YOLOv8n COCO (knife/scissors).")
     model = YOLO("yolov8n.pt")
     WEAPON_CLASSES = {49: "knife", 76: "scissors"}
@@ -88,14 +85,10 @@ def load_weapon_model():
 
 
 def load_vlm():
-    """Load SmolVLM2-2.2B-Instruct in 4-bit quantization."""
     try:
         from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
         log.info("Loading SmolVLM2-2.2B-Instruct (4-bit)...")
-        bnb       = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16
-        )
+        bnb       = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
         processor = AutoProcessor.from_pretrained(VLM_MODEL_ID)
         model     = AutoModelForImageTextToText.from_pretrained(
             VLM_MODEL_ID,
@@ -131,18 +124,14 @@ Respond ONLY with valid JSON and nothing else:
 {"threat": true, "type": "fight|weapon|intrusion|assault", "confidence": "low|medium|high", "description": "One concise sentence"}"""
 
 
-# ── Core VLM Inference (SmolVLM2) ─────────────────────────────────────────────
-def _smolvlm_infer(crop_bgr: np.ndarray, prompt: str, vlm_model, processor, max_tokens: int = 80) -> str:
-    """
-    Single inference call — takes BGR crop, returns raw string output.
-    All other VLM helpers call this.
-    """
+# ── Core VLM Inference ────────────────────────────────────────────────────────
+def _smolvlm_infer(crop_bgr: np.ndarray, prompt: str, vlm_model, processor,
+                   max_tokens: int = 60) -> str:
     if vlm_model is None or processor is None:
         return ""
     try:
-        # Resize to max 512px on longest side
-        h, w    = crop_bgr.shape[:2]
-        scale   = 512 / max(h, w)
+        h, w  = crop_bgr.shape[:2]
+        scale = 512 / max(h, w)
         if scale < 1.0:
             crop_bgr = cv2.resize(crop_bgr, (int(w * scale), int(h * scale)),
                                   interpolation=cv2.INTER_AREA)
@@ -150,32 +139,21 @@ def _smolvlm_infer(crop_bgr: np.ndarray, prompt: str, vlm_model, processor, max_
         image    = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
         messages = [{
             "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt}
-            ]
+            "content": [{"type": "image"}, {"type": "text", "text": prompt}]
         }]
-
         text_prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
         inputs      = processor(
-            text=text_prompt,
-            images=[image],
-            return_tensors="pt"
+            text=text_prompt, images=[image], return_tensors="pt"
         ).to(vlm_model.device, dtype=torch.bfloat16)
 
         with torch.no_grad():
             out = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=max_tokens)
 
         result = processor.batch_decode(out, skip_special_tokens=True)[0].strip()
-
-        # Strip assistant prefix SmolVLM2 sometimes adds
         if "Assistant:" in result:
             result = result.split("Assistant:")[-1].strip()
-
-        # Return last non-empty line
         lines = [l.strip() for l in result.split("\n") if l.strip()]
         return lines[-1] if lines else result
-
     except Exception as e:
         log.warning(f"[VLM] Inference error: {e}")
         return ""
@@ -184,45 +162,35 @@ def _smolvlm_infer(crop_bgr: np.ndarray, prompt: str, vlm_model, processor, max_
 
 
 def run_vlm(crop_bgr: np.ndarray, vlm_model, processor) -> dict:
-    """Threat analysis — returns parsed JSON dict."""
     if vlm_model is None or processor is None:
-        return {"threat": False, "type": "none", "confidence": "low", "description": "VLM not loaded"}
-
+        return {"threat": False, "type": "none", "confidence": "low",
+                "description": "VLM not loaded"}
     raw = _smolvlm_infer(crop_bgr, VLM_THREAT_PROMPT, vlm_model, processor, max_tokens=80)
-
-    # Try to parse JSON
     try:
         js = raw[raw.rfind("{") : raw.rfind("}") + 1]
         return json.loads(js)
     except (json.JSONDecodeError, ValueError):
-        # SmolVLM2 sometimes returns plain text — parse manually
         is_threat = "threat: yes" in raw.lower() or '"threat": true' in raw.lower()
         return {
             "threat":      is_threat,
             "type":        "assault" if is_threat else "none",
             "confidence":  "medium" if is_threat else "low",
-            "description": raw[:120]
+            "description": raw[:120],
         }
 
 
 def run_vlm_text(crop_bgr: np.ndarray, prompt: str, vlm_model, processor) -> str:
-    """Free-text VLM response — for scene/person descriptions."""
-    return _smolvlm_infer(crop_bgr, prompt, vlm_model, processor, max_tokens=80)
+    return _smolvlm_infer(crop_bgr, prompt, vlm_model, processor, max_tokens=60)
 
 
-# ── Weapon Inference + Drawing ────────────────────────────────────────────────
+# ── Weapon Inference ──────────────────────────────────────────────────────────
 def run_weapon_inference(weapon_model, frame: np.ndarray) -> tuple:
-    """
-    Run weapons model on frame.
-    Returns: (detections, trigger_reason, trigger_crop)
-      detections    — list of {label, confidence, bbox}
-      trigger_reason — string if weapon found, else None
-      trigger_crop  — padded crop around first weapon, else None
-    """
-    results        = weapon_model(frame, conf=0.40, imgsz=640, verbose=False)
+    results        = weapon_model(frame, conf=0.55, imgsz=640, verbose=False)
     detections     = []
     trigger_reason = None
     trigger_crop   = None
+    fh, fw         = frame.shape[:2]
+    frame_area     = fh * fw
 
     for box in results[0].boxes:
         cls_id = int(box.cls[0])
@@ -230,27 +198,46 @@ def run_weapon_inference(weapon_model, frame: np.ndarray) -> tuple:
         name   = WEAPON_CLASSES.get(cls_id, "weapon")
         xyxy   = box.xyxy[0].cpu().numpy()
 
+        x1, y1, x2, y2 = map(int, xyxy)
+        box_w  = x2 - x1
+        box_h  = y2 - y1
+        area   = box_w * box_h
+        aspect = box_w / max(box_h, 1)
+
+        # ── False positive filters ────────────────────────────────────────────
+        # Too small — ID cards, badges, phones are typically < 1.5% frame area
+        if area < frame_area * 0.015:
+            log.debug(f"[WEAPON] {name} skipped — too small ({area}px²)")
+            continue
+
+        # Bad aspect ratio — guns/knives are elongated (1.2–7.0)
+        if not (1.2 < aspect < 7.0):
+            log.debug(f"[WEAPON] {name} skipped — aspect {aspect:.2f} out of range")
+            continue
+
+        # Implausibly large bbox — likely a full-frame false detection
+        if box_w > fw * 0.85 or box_h > fh * 0.85:
+            log.debug(f"[WEAPON] {name} skipped — bbox too large")
+            continue
+
         detections.append({
             "label":      name,
             "confidence": round(conf, 2),
-            "bbox":       list(map(int, xyxy.tolist())),
+            "bbox":       [x1, y1, x2, y2],
         })
 
         if trigger_reason is None:
             trigger_reason = f"Weapon detected: {name} ({int(conf * 100)}%)"
             trigger_crop   = pad_crop(frame, xyxy)
-
-        log.info(f"[WEAPON] {name} @ {int(conf * 100)}% conf")
+            log.info(f"[WEAPON] ✅ {name} @ {int(conf*100)}% | area={area} aspect={aspect:.2f}")
 
     return detections, trigger_reason, trigger_crop
 
 
 def draw_weapon_boxes(frame: np.ndarray, detections: list) -> np.ndarray:
-    """Draw red labeled boxes for weapon detections on top of YOLO26 overlay."""
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
         label           = f"{det['label']} {int(det['confidence'] * 100)}%"
-
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0, 0, 255), -1)
@@ -295,7 +282,7 @@ def push_alert(alert: str, reason: str, vlm_result: dict = None):
             entry = {
                 "time":   datetime.now().strftime("%H:%M:%S"),
                 "alert":  alert,
-                "reason": reason
+                "reason": reason,
             }
             if vlm_result:
                 entry["vlm"] = vlm_result.get("description", "")
@@ -331,67 +318,3 @@ class ProximityTracker:
                 del self.pair_since[p]
 
         return result
-
-
-# ── People Logger ─────────────────────────────────────────────────────────────
-class PeopleLogger:
-    def __init__(self):
-        self.prev_positions: dict = {}
-        self.crossed_ids: set     = set()
-        self.counts               = {"enter": 0, "exit": 0}
-        self._init_csv()
-
-    def _init_csv(self):
-        if not CSV_LOG_PATH.exists():
-            with open(CSV_LOG_PATH, "w", newline="") as f:
-                csv.writer(f).writerow(
-                    ["timestamp", "track_id", "event", "confidence", "alert_state"]
-                )
-
-    def _write_csv(self, entry: dict):
-        with open(CSV_LOG_PATH, "a", newline="") as f:
-            csv.writer(f).writerow([
-                entry["timestamp"], entry["track_id"],
-                entry["event"],     entry["confidence"],
-                entry["alert_state"]
-            ])
-
-    def _write_json(self, entry: dict):
-        data = []
-        if JSON_LOG_PATH.exists():
-            try:
-                with open(JSON_LOG_PATH) as f:
-                    data = json.load(f)
-            except json.JSONDecodeError:
-                data = []
-        data.append(entry)
-        with open(JSON_LOG_PATH, "w") as f:
-            json.dump(data[-500:], f, indent=2)
-
-    def update(self, track_id: int, center_y: float,
-               frame_height: int, conf: float, alert_state: str):
-        line_y = frame_height * LINE_POSITION
-        if track_id in self.prev_positions:
-            prev_y  = self.prev_positions[track_id]
-            crossed = (prev_y < line_y <= center_y) or (prev_y > line_y >= center_y)
-            if crossed and track_id not in self.crossed_ids:
-                event = "EXIT" if center_y >= line_y else "ENTER"
-                self.crossed_ids.add(track_id)
-                self.counts[event.lower()] += 1
-                entry = {
-                    "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "track_id":    track_id,
-                    "event":       event,
-                    "confidence":  round(conf, 2),
-                    "alert_state": alert_state,
-                }
-                self._write_csv(entry)
-                self._write_json(entry)
-                log.info(
-                    f"[LOG] ID#{track_id} → {event} | "
-                    f"IN:{self.counts['enter']} OUT:{self.counts['exit']}"
-                )
-        self.prev_positions[track_id] = center_y
-
-    def get_counts(self) -> dict:
-        return self.counts

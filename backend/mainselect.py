@@ -35,11 +35,9 @@ STREAM_FPS    = 30
 NEW_PERSON_COOLDOWN = 30.0
 VLM_COOLDOWN        = 8.0
 COUNT_CHANGE_DELAY  = 2.0
+VLM_THREAD_TIMEOUT  = 20.0   # abandon hung VLM threads after 20s
 
 # ── Detection modes ───────────────────────────────────────────────────────────
-# "both"      → YOLO26n + weapon model + VLM (full pipeline)
-# "yolo_only" → YOLO26n + weapon model, no VLM calls at all (fastest)
-# "vlm_only"  → YOLO26n for person count/boxes only, VLM passive + person desc
 VALID_MODES = {"both", "yolo_only", "vlm_only"}
 
 app = FastAPI()
@@ -58,15 +56,15 @@ state["person_count"]      = 0
 state["weapon_detections"] = []
 state["source_fps"]        = 0.0
 state["vlm_enabled"]       = True
-state["detection_mode"]    = "both"    # "both" | "yolo_only" | "vlm_only"
-state["vlm_interval"]      = 15.0     # passive scene interval in seconds (user-configurable)
+state["detection_mode"]    = "both"
+state["vlm_interval"]      = 15.0
 
 # ── Load models ───────────────────────────────────────────────────────────────
 yolo_model            = load_yolo()
 weapon_model          = load_weapon_model()
 vlm_model, vlm_processor = load_vlm()
 
-# ── GPU optimizations for RTX 3060 6GB ───────────────────────────────────────
+# ── GPU optimizations ────────────────────────────────────────────────────────
 if torch.cuda.is_available():
     torch.cuda.set_per_process_memory_fraction(0.85)
     yolo_model.to("cuda")
@@ -140,6 +138,14 @@ def call_vlm_text(crop_bgr: np.ndarray, prompt: str) -> str:
         torch.cuda.empty_cache()
 
 
+# ── VLM thread helper — stamps start time for watchdog ───────────────────────
+def _start_vlm_thread(target, args):
+    t = threading.Thread(target=target, args=args, daemon=True)
+    t._start_time = time.time()
+    t.start()
+    return t
+
+
 # ── Detection engine ──────────────────────────────────────────────────────────
 def run_engine(source):
     prox              = ProximityTracker()
@@ -194,7 +200,11 @@ def run_engine(source):
         desc = call_vlm_text(crop, PERSON_PROMPT)
         if not desc:
             return
-        entry = {"time": datetime.now().strftime("%H:%M:%S"), "track_id": track_id, "description": desc}
+        entry = {
+            "time":        datetime.now().strftime("%H:%M:%S"),
+            "track_id":    track_id,
+            "description": desc,
+        }
         with state_lock:
             state["person_log"].append(entry)
             state["person_log"] = state["person_log"][-50:]
@@ -221,7 +231,7 @@ def run_engine(source):
         frame_count += 1
         now = time.time()
 
-        # Read all config flags once per frame
+        # ── Read all config flags once per frame ──────────────────────────────
         with state_lock:
             vlm_on   = state["vlm_enabled"]
             mode     = state["detection_mode"]
@@ -229,27 +239,40 @@ def run_engine(source):
             last_vlm = state["last_vlm_time"]
 
         use_vlm    = vlm_on and mode in ("both", "vlm_only")
-        use_weapon = mode in ("both", "yolo_only")   # weapon model skipped in vlm_only
+        use_weapon = mode in ("both", "yolo_only")
 
-        # ── YOLO26n tracking (always runs for visualization + count) ──────────
+        # ── VLM thread watchdog — abandon if hung > 20s ───────────────────────
+        if (vlm_thread is not None and
+                vlm_thread.is_alive() and
+                hasattr(vlm_thread, "_start_time") and
+                now - vlm_thread._start_time > VLM_THREAD_TIMEOUT):
+            log.warning("[VLM] Thread hung >20s — abandoning + clearing VRAM")
+            vlm_thread = None
+            torch.cuda.empty_cache()
+
+        # ── If switched to yolo_only mid-session, abandon stale VLM thread ───
+        if not use_vlm and vlm_thread is not None and vlm_thread.is_alive():
+            vlm_thread.join(timeout=0.05)
+            if not vlm_thread.is_alive():
+                vlm_thread = None
+
+        # ── YOLO26n tracking (always runs) ────────────────────────────────────
         track_results = yolo_model.track(
             frame, persist=True, tracker="bytetrack.yaml",
             conf=0.4, imgsz=640, verbose=False
         )
 
-        # ── Weapons model (skipped in vlm_only mode) ──────────────────────────
+        # ── Weapons model (skipped in vlm_only) ───────────────────────────────
         weapon_detections = []
         weapon_trigger    = None
-        weapon_crop       = None
 
         if use_weapon:
-            weapon_detections, weapon_trigger, weapon_crop = run_weapon_inference(weapon_model, frame)
+            weapon_detections, weapon_trigger, _ = run_weapon_inference(weapon_model, frame)
 
         with state_lock:
             state["weapon_detections"] = weapon_detections
 
         people_boxes = {}
-        # In vlm_only mode, weapon/proximity triggers are suppressed
         yolo_trigger = weapon_trigger if mode == "both" else None
         class_counts = {}
 
@@ -276,12 +299,8 @@ def run_engine(source):
                     described_ids[track_id] = now
                     person_crop = pad_crop(frame, xyxy, pad=40)
                     if person_crop.size > 0:
-                        vlm_thread = threading.Thread(
-                            target=person_vlm,
-                            args=(track_id, person_crop.copy()),
-                            daemon=True
-                        )
-                        vlm_thread.start()
+                        vlm_thread = _start_vlm_thread(
+                            person_vlm, (track_id, person_crop.copy()))
 
         # ── Person count change ───────────────────────────────────────────────
         current_count = len(people_boxes)
@@ -293,7 +312,7 @@ def run_engine(source):
             count_changed_at  = now
             prev_person_count = current_count
 
-        # Count change VLM (all modes that have VLM)
+        # Count change VLM
         if (use_vlm and
                 count_changed_at is not None and
                 now - count_changed_at >= COUNT_CHANGE_DELAY and
@@ -303,10 +322,8 @@ def run_engine(source):
             with state_lock:
                 state["last_vlm_time"] = now
             count_changed_at = None
-            vlm_thread = threading.Thread(
-                target=scene_vlm, args=(frame.copy(), COUNT_CHANGE_PROMPT), daemon=True
-            )
-            vlm_thread.start()
+            vlm_thread = _start_vlm_thread(
+                scene_vlm, (frame.copy(), COUNT_CHANGE_PROMPT))
             log.info(f"[COUNT VLM] triggered — {current_count} person(s)")
 
         # ── Proximity check (both mode only) ──────────────────────────────────
@@ -321,7 +338,7 @@ def run_engine(source):
             last_red  = state["last_red_time"]
             last_vlm  = state["last_vlm_time"]
 
-        # ── Threat VLM (both mode only) ───────────────────────────────────────
+        # ── Alert logic ───────────────────────────────────────────────────────
         if mode == "both" and yolo_trigger:
             reason, crop = yolo_trigger
             if (use_vlm and
@@ -330,17 +347,18 @@ def run_engine(source):
                     (vlm_thread is None or not vlm_thread.is_alive())):
                 with state_lock:
                     state["last_vlm_time"] = now
-                vlm_thread = threading.Thread(
-                    target=threat_vlm, args=(crop.copy(), reason), daemon=True)
-                vlm_thread.start()
+                vlm_thread = _start_vlm_thread(threat_vlm, (crop.copy(), reason))
             if cur_alert == "CLEAR":
                 push_alert("YELLOW", reason)
+
         elif mode == "yolo_only" and weapon_trigger:
-            # In yolo_only, still raise YELLOW from weapon detection — no VLM confirm
+            # Raise YELLOW from weapon without VLM confirm
             reason, _ = weapon_trigger
             if cur_alert == "CLEAR":
                 push_alert("YELLOW", reason)
+
         else:
+            # No trigger — clear alert after hold time expires
             if (cur_alert != "CLEAR" and
                     now - last_red >= RED_HOLD_SEC and
                     (vlm_thread is None or not vlm_thread.is_alive())):
@@ -349,15 +367,13 @@ def run_engine(source):
         # ── Passive scene VLM (configurable interval) ─────────────────────────
         if (use_vlm and
                 vlm_model is not None and
-                now - last_vlm >= vlm_ivl and      # ← uses state["vlm_interval"]
+                now - last_vlm >= vlm_ivl and
                 count_changed_at is None and
                 not yolo_trigger and
                 (vlm_thread is None or not vlm_thread.is_alive())):
             with state_lock:
                 state["last_vlm_time"] = now
-            vlm_thread = threading.Thread(
-                target=scene_vlm, args=(frame.copy(),), daemon=True)
-            vlm_thread.start()
+            vlm_thread = _start_vlm_thread(scene_vlm, (frame.copy(),))
 
         # ── Detection summary ─────────────────────────────────────────────────
         weapon_names = [d["label"] for d in weapon_detections]
@@ -375,7 +391,7 @@ def run_engine(source):
         annotated = track_results[0].plot()
         if weapon_detections:
             annotated = draw_weapon_boxes(annotated, weapon_detections)
-        h, w = annotated.shape[:2]
+        h_f, w_f = annotated.shape[:2]
 
         with state_lock:
             alert_now  = state["alert"]
@@ -387,30 +403,32 @@ def run_engine(source):
 
         # Alert banner
         color = {"CLEAR": (30,160,30), "YELLOW": (0,180,255), "RED": (0,0,210)}.get(alert_now, (60,60,60))
-        cv2.rectangle(annotated, (0, 0), (w, 52), color, -1)
+        cv2.rectangle(annotated, (0, 0), (w_f, 52), color, -1)
         cv2.putText(annotated, f"[{alert_now}]  {reason_now[:72]}",
                     (8, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 0, 0), 2)
 
-        # Person count + mode badge (top-right)
+        # Top-right badge
         badge = f"People:{count_now}  [{mode_now.upper()}]"
-        cv2.rectangle(annotated, (w-260, 0), (w, 52), (30, 30, 30), -1)
+        cv2.rectangle(annotated, (w_f-260, 0), (w_f, 52), (30, 30, 30), -1)
         cv2.putText(annotated, badge,
-                    (w-250, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+                    (w_f-250, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
 
-        # Bottom indicators
+        # Bottom-right indicators
         cv2.putText(annotated, f"{actual_fps:.0f}fps",
-                    (w-55, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
-        vlm_label = "VLM:ON" if (vlm_on_now and mode_now != "yolo_only") else "VLM:OFF"
-        vlm_color = (160, 100, 255) if (vlm_on_now and mode_now != "yolo_only") else (80, 80, 80)
+                    (w_f-55, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
+        vlm_active = vlm_on_now and mode_now != "yolo_only"
+        vlm_label  = "VLM:ON" if vlm_active else "VLM:OFF"
+        vlm_color  = (160, 100, 255) if vlm_active else (80, 80, 80)
         cv2.putText(annotated, vlm_label,
-                    (w-75, h-28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, vlm_color, 1)
+                    (w_f-75, h_f-28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, vlm_color, 1)
 
+        # Bottom-left scene description
         if desc_now and use_vlm:
             cv2.putText(annotated, f"Scene: {desc_now[:90]}",
-                        (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 255, 200), 1)
+                        (8, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 255, 200), 1)
         elif not use_vlm:
             cv2.putText(annotated, f"Mode: {mode_now} — VLM inactive",
-                        (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (80, 80, 80), 1)
+                        (8, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (80, 80, 80), 1)
 
         _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
         with engine["frame_lock"]:
@@ -570,17 +588,17 @@ def vlm_disable():
 @app.post("/mode/{mode}")
 def set_mode(mode: str):
     if mode not in VALID_MODES:
-        return {"error": f"Invalid mode. Use one of: {VALID_MODES}"}
+        return {"error": f"Invalid mode. Choose from: {VALID_MODES}"}
     with state_lock:
         state["detection_mode"] = mode
-    log.info(f"[MODE] Switched to {mode}")
+    log.info(f"[MODE] → {mode}")
     return {"detection_mode": mode}
 
 
 @app.post("/vlm/interval")
 def set_vlm_interval(seconds: float):
-    seconds = max(5.0, min(seconds, 120.0))   # clamp 5–120s
+    seconds = max(5.0, min(seconds, 120.0))
     with state_lock:
         state["vlm_interval"] = seconds
-    log.info(f"[VLM] Interval set to {seconds}s")
+    log.info(f"[VLM] Interval → {seconds}s")
     return {"vlm_interval": seconds}
